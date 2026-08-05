@@ -334,6 +334,29 @@ function waitForTabComplete(tabId, timeout = 20000) {
   });
 }
 
+// One tab, reused across every post, instead of opening a fresh tab and
+// destroying it each time. Falls back to creating a new one if the previous
+// tab was closed (by you, or by Kiwi reclaiming memory) or navigated away.
+async function getOrCreateManagedTab() {
+  const { managedTabId } = await chrome.storage.session.get("managedTabId");
+  if (managedTabId) {
+    try {
+      const existing = await chrome.tabs.get(managedTabId);
+      if (existing) {
+        await chrome.tabs.update(existing.id, { url: TARGET_URL });
+        await waitForTabComplete(existing.id);
+        return existing.id;
+      }
+    } catch (e) {
+      // Tab's gone — fall through and make a new one.
+    }
+  }
+  const tab = await chrome.tabs.create({ url: TARGET_URL, active: DEBUG_VISIBLE_TAB });
+  await waitForTabComplete(tab.id);
+  await chrome.storage.session.set({ managedTabId: tab.id });
+  return tab.id;
+}
+
 function arrayBufferToBase64(buffer) {
   const bytes = new Uint8Array(buffer);
   let binary = "";
@@ -345,7 +368,6 @@ function arrayBufferToBase64(buffer) {
 }
 
 async function postOne(text, media) {
-  let tab;
   try {
     let mediaBase64 = null;
     let mediaType = null;
@@ -359,29 +381,24 @@ async function postOne(text, media) {
       mediaName = record.name;
     }
 
-    tab = await chrome.tabs.create({ url: TARGET_URL, active: DEBUG_VISIBLE_TAB });
-    await waitForTabComplete(tab.id);
+    const tabId = await getOrCreateManagedTab();
     // Give the SPA a moment to hydrate after "complete" fires — jittered so
     // every run doesn't take an identical, machine-like amount of time.
     await new Promise((r) => setTimeout(r, jitter(1200, 2800)));
 
     const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
+      target: { tabId },
       func: xAutoPostInjected,
       args: [text, mediaBase64, mediaType, mediaName],
     });
 
-    const result = results?.[0]?.result || {
-      success: false,
-      error: "No result from injected script",
-    };
-
-    if (!DEBUG_VISIBLE_TAB && result.success) {
-      setTimeout(() => chrome.tabs.remove(tab.id).catch(() => {}), 2000);
-    }
-    return result;
+    return (
+      results?.[0]?.result || {
+        success: false,
+        error: "No result from injected script",
+      }
+    );
   } catch (e) {
-    if (tab && !DEBUG_VISIBLE_TAB) chrome.tabs.remove(tab.id).catch(() => {});
     return { success: false, error: e.message };
   }
 }
