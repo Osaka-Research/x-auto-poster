@@ -1,0 +1,98 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# tunnel-x-post: run the x-post-queue server and expose it over a Cloudflare
+# quick tunnel, so you can queue posts to the X-posting extension from any
+# device (phone, PC, whatever) without touching the Kiwi browser on this phone.
+# No Cloudflare account required. Same approach as tunnel-harvest.
+#
+# usage:
+#   tunnel-x-post          # start server + tunnel, blocks until Ctrl-C
+#   tunnel-x-post --print  # print the link for an already-running tunnel
+
+set -e
+SERVER="$HOME/projects/x-auto-poster/server/queue_server.py"
+PORT="${TUNNEL_X_POST_PORT:-8090}"
+CF="${CLOUDFLARED:-$HOME/bin/cloudflared}"
+RESOLV_HOST=/data/data/com.termux/files/usr/tmp/resolv.conf
+CA_HOST=/data/data/com.termux/files/usr/etc/tls/cert.pem
+TOKEN_PATH="$HOME/.local/share/x-post-queue/token"
+
+[ -x "$CF" ] || { echo "cloudflared not found at $CF" >&2; exit 1; }
+[ -f "$SERVER" ] || { echo "server script missing: $SERVER" >&2; exit 1; }
+
+TMP="${TMPDIR:-/data/data/com.termux/files/usr/tmp}"
+mkdir -p "$TMP"
+LOG="$TMP/tunnel-x-post.log"
+SERVE_PID="$TMP/tunnel-x-post.serve.pid"
+CF_PID="$TMP/tunnel-x-post.cf.pid"
+URL_FILE="$TMP/tunnel-x-post.url"
+
+if [ ! -f "$RESOLV_HOST" ]; then
+  printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$RESOLV_HOST"
+fi
+[ -f "$CA_HOST" ] || { echo "CA bundle not found at $CA_HOST" >&2; exit 1; }
+
+PROOT_BIN="${PROOT:-proot}"
+PROOT_FLAGS=(
+  -b "$RESOLV_HOST:/etc/resolv.conf"
+  -b "$CA_HOST:/etc/ssl/certs/ca-certificates.crt"
+)
+
+start_serve(){
+  python3 "$SERVER" "$PORT" >"$LOG" 2>&1 &
+  echo $! > "$SERVE_PID"
+  sleep 0.5
+}
+
+start_tunnel(){
+  rm -f "$URL_FILE"
+  "$PROOT_BIN" "${PROOT_FLAGS[@]}" "$CF" tunnel --no-autoupdate --url "http://127.0.0.1:$PORT" 2>&1 \
+    | tee -a "$LOG" \
+    | grep --line-buffered -oE 'https://[a-z0-9-]+\.trycloudflare\.com' \
+    | head -1 > "$URL_FILE" &
+  echo $! > "$CF_PID"
+  for _ in $(seq 1 60); do
+    [ -s "$URL_FILE" ] && break
+    sleep 0.5
+  done
+  cat "$URL_FILE"
+}
+
+print_link(){
+  [ -s "$URL_FILE" ] || { echo "no tunnel running" >&2; exit 1; }
+  [ -f "$TOKEN_PATH" ] || { echo "no token yet — start the server first" >&2; exit 1; }
+  URL="$(cat "$URL_FILE")"
+  TOKEN="$(cat "$TOKEN_PATH")"
+  echo "form:  $URL/?token=$TOKEN"
+  echo "token: $TOKEN"
+  echo
+  echo "extension settings -> Remote inbox URL: $URL"
+  echo "extension settings -> Remote inbox token: $TOKEN"
+}
+
+shutdown(){
+  for f in "$CF_PID" "$SERVE_PID"; do
+    [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null || true
+    rm -f "$f"
+  done
+}
+trap 'shutdown; exit' INT TERM
+
+case "${1:-}" in
+  --print)
+    print_link
+    ;;
+  "")
+    start_serve
+    URL=$(start_tunnel)
+    [ -n "$URL" ] || { echo "tunnel failed; recent log:" >&2; tail -25 "$LOG" >&2; shutdown; exit 1; }
+    echo
+    print_link
+    echo
+    echo "Ctrl-C to stop. Keep Kiwi open on this phone so the extension can poll for new posts."
+    wait
+    ;;
+  *)
+    echo "usage: tunnel-x-post [--print]" >&2
+    exit 1
+    ;;
+esac

@@ -1,0 +1,199 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>X Post Queue</title>
+    <style>
+      body {
+        width: 340px;
+        font-family: system-ui, sans-serif;
+        padding: 10px;
+        color: #1a1a1a;
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0 0 8px;
+      }
+      textarea {
+        width: 100%;
+        box-sizing: border-box;
+        min-height: 70px;
+        resize: vertical;
+        font-family: inherit;
+        font-size: 13px;
+        padding: 6px;
+      }
+      .row {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+        margin-top: 6px;
+      }
+      input[type="datetime-local"] {
+        flex: 1;
+        font-size: 12px;
+      }
+      button {
+        cursor: pointer;
+        border: 1px solid #ccc;
+        background: #f5f5f5;
+        border-radius: 4px;
+        padding: 5px 8px;
+        font-size: 12px;
+      }
+      button.primary {
+        background: #1d9bf0;
+        color: #fff;
+        border-color: #1d9bf0;
+      }
+      #addBtn {
+        width: 100%;
+        margin-top: 6px;
+      }
+      #checkNowBtn {
+        width: 100%;
+        margin-top: 4px;
+      }
+      ul#list {
+        list-style: none;
+        margin: 10px 0 0;
+        padding: 0;
+        max-height: 260px;
+        overflow-y: auto;
+      }
+      li {
+        border: 1px solid #e5e5e5;
+        border-radius: 6px;
+        padding: 6px 8px;
+        margin-bottom: 6px;
+        font-size: 12px;
+      }
+      .text {
+        white-space: pre-wrap;
+        word-break: break-word;
+        margin-bottom: 4px;
+      }
+      .meta {
+        color: #666;
+        font-size: 11px;
+        margin-bottom: 4px;
+      }
+      .status {
+        font-weight: 600;
+      }
+      .status.pending {
+        color: #b58900;
+      }
+      .status.posted {
+        color: #2e7d32;
+      }
+      .status.failed {
+        color: #c62828;
+      }
+      .actions {
+        display: flex;
+        gap: 6px;
+      }
+      .empty {
+        color: #888;
+        font-size: 12px;
+        text-align: center;
+        padding: 10px 0;
+      }
+      #media {
+        width: 100%;
+        font-size: 11px;
+        margin-top: 6px;
+      }
+      #mediaInfo {
+        font-size: 11px;
+        color: #444;
+        margin-top: 2px;
+      }
+      .clearMedia {
+        font-size: 11px;
+        margin-left: 6px;
+      }
+      .media-chip {
+        display: inline-block;
+        background: #eef6fd;
+        color: #1d9bf0;
+        border-radius: 4px;
+        padding: 1px 5px;
+        margin-right: 4px;
+      }
+      #pauseBanner {
+        display: none;
+        background: #fdecea;
+        border: 1px solid #f5c2c0;
+        color: #7a1f1a;
+        border-radius: 6px;
+        padding: 6px 8px;
+        font-size: 12px;
+        margin-bottom: 8px;
+      }
+      #pauseBanner button {
+        margin-top: 4px;
+        width: 100%;
+      }
+      details#settings {
+        margin-top: 8px;
+        font-size: 12px;
+      }
+      details#settings summary {
+        cursor: pointer;
+        color: #555;
+      }
+      .settingsRow {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        margin-top: 6px;
+      }
+      .settingsRow input {
+        width: 60px;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>X Post Queue</h1>
+    <div id="pauseBanner">
+      <div id="pauseReasonText"></div>
+      <button id="resumeBtn">Resume automation</button>
+    </div>
+    <textarea id="text" placeholder="What's happening?"></textarea>
+    <input type="file" id="media" accept="image/*,video/*" />
+    <div id="mediaInfo"></div>
+    <div class="row">
+      <input type="datetime-local" id="when" />
+    </div>
+    <button id="addBtn" class="primary">Add to queue</button>
+    <button id="checkNowBtn">Check &amp; post due now</button>
+    <ul id="list"></ul>
+    <details id="settings">
+      <summary>Safety limits</summary>
+      <div class="settingsRow">
+        <label for="minGap">Min minutes between posts</label>
+        <input type="number" id="minGap" min="0" />
+      </div>
+      <div class="settingsRow">
+        <label for="maxDaily">Max posts per 24h</label>
+        <input type="number" id="maxDaily" min="1" />
+      </div>
+      <div class="settingsRow" style="margin-top: 10px; border-top: 1px solid #eee; padding-top: 8px;">
+        <label style="flex: 0 0 auto;">Remote inbox</label>
+      </div>
+      <div class="settingsRow">
+        <input type="text" id="remoteUrl" placeholder="https://xxxx.trycloudflare.com" style="width: 100%; flex: 1;" />
+      </div>
+      <div class="settingsRow">
+        <input type="text" id="remoteToken" placeholder="token" style="width: 100%; flex: 1;" />
+      </div>
+      <div id="remoteStatus" style="color: #888; margin-top: 4px;"></div>
+    </details>
+    <script src="idb.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,492 @@
+// Service worker: periodically checks the local queue and auto-posts anything due.
+// NOTE: on Android/Kiwi this only runs while the browser is open/foregrounded —
+// there is no true background execution while the app is fully closed.
+
+importScripts("idb.js");
+
+const ALARM_NAME = "check-queue";
+const TARGET_URL = "https://x.com/home";
+let isProcessing = false;
+
+// Now that posting is confirmed working, run quietly in the background instead
+// of stealing focus. Flip back to true if you need to watch a run again.
+const DEBUG_VISIBLE_TAB = false;
+
+const DEFAULT_SETTINGS = {
+  minGapMinutes: 20,
+  maxPostsPerDay: 15,
+  remoteUrl: "",
+  remoteToken: "",
+};
+
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.alarms.create(ALARM_NAME, { periodInMinutes: 1 });
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  chrome.alarms.create(ALARM_NAME, { periodInMinutes: 1 });
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === ALARM_NAME) {
+    pollRemoteInbox().finally(() => runQueueCheck());
+  }
+});
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type === "CHECK_NOW") {
+    pollRemoteInbox().finally(() => runQueueCheck().then(() => sendResponse({ ok: true })));
+    return true; // keep channel open for async response
+  }
+  if (msg?.type === "RESUME_AUTOMATION") {
+    chrome.storage.local
+      .set({ automationPaused: false, pauseReason: null, consecutiveFailures: 0 })
+      .then(() => sendResponse({ ok: true }));
+    return true;
+  }
+});
+
+async function getQueue() {
+  const { queue } = await chrome.storage.local.get("queue");
+  return Array.isArray(queue) ? queue : [];
+}
+
+async function setQueue(queue) {
+  await chrome.storage.local.set({ queue });
+}
+
+async function getSettings() {
+  const { settings } = await chrome.storage.local.get("settings");
+  return Object.assign({}, DEFAULT_SETTINGS, settings || {});
+}
+
+async function getPostLog() {
+  const { postLog } = await chrome.storage.local.get("postLog");
+  return Array.isArray(postLog) ? postLog : [];
+}
+
+async function recordPosted() {
+  const log = await getPostLog();
+  log.push(Date.now());
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  await chrome.storage.local.set({ postLog: log.filter((ts) => ts > cutoff).slice(-500) });
+}
+
+function base64ToBlob(base64, mimeType) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mimeType || "application/octet-stream" });
+}
+
+async function getProcessedRemoteIds() {
+  const { processedRemoteIds } = await chrome.storage.local.get("processedRemoteIds");
+  return Array.isArray(processedRemoteIds) ? processedRemoteIds : [];
+}
+
+// Pulls new items from the remote inbox server (if configured) into the local
+// queue, so posts can be submitted from any device without touching Kiwi.
+// The remote server never talks to X directly — it only hands off drafts here.
+async function pollRemoteInbox() {
+  const settings = await getSettings();
+  if (!settings.remoteUrl || !settings.remoteToken) return;
+
+  try {
+    const res = await fetch(settings.remoteUrl + "/pending", {
+      headers: { Authorization: "Bearer " + settings.remoteToken },
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const items = Array.isArray(data.items) ? data.items : [];
+
+    if (items.length === 0) {
+      await chrome.storage.local.set({ lastRemotePoll: { at: Date.now(), pulled: 0, error: null } });
+      return;
+    }
+
+    const processed = new Set(await getProcessedRemoteIds());
+    const queue = await getQueue();
+    const ackIds = [];
+    let addedCount = 0;
+
+    for (const remote of items) {
+      ackIds.push(remote.id);
+      if (processed.has(remote.id)) continue; // already imported in a prior poll; just clean it up server-side
+
+      let media = null;
+      if (remote.media && remote.media.base64) {
+        const mediaId = crypto.randomUUID();
+        const blob = base64ToBlob(remote.media.base64, remote.media.type);
+        await saveMedia(mediaId, blob, remote.media.name || "upload", remote.media.type || "");
+        media = { id: mediaId, name: remote.media.name || "upload", type: remote.media.type || "" };
+      }
+
+      queue.push({
+        id: crypto.randomUUID(),
+        text: (remote.text || "").trim(),
+        media,
+        scheduledAt: remote.scheduledAt || null,
+        dueJitterMs: remote.scheduledAt ? Math.floor(Math.random() * 3 * 60 * 1000) : 0,
+        status: "pending",
+        error: null,
+        postedAt: null,
+        createdAt: Date.now(),
+        source: "remote",
+      });
+      processed.add(remote.id);
+      addedCount++;
+    }
+
+    await setQueue(queue);
+    await chrome.storage.local.set({ processedRemoteIds: Array.from(processed).slice(-1000) });
+
+    // Best-effort cleanup; a failed ack just means these get skipped (dedup'd) next poll.
+    fetch(settings.remoteUrl + "/ack", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + settings.remoteToken },
+      body: JSON.stringify({ ids: ackIds }),
+    }).catch(() => {});
+
+    await chrome.storage.local.set({
+      lastRemotePoll: { at: Date.now(), pulled: addedCount, error: null },
+    });
+  } catch (e) {
+    await chrome.storage.local.set({ lastRemotePoll: { at: Date.now(), pulled: 0, error: e.message } });
+  }
+}
+
+// Gate on safety limits + pause state. Does NOT gate on whether anything is
+// actually due — callers check that separately.
+async function checkCanPost() {
+  const { automationPaused, pauseReason } = await chrome.storage.local.get([
+    "automationPaused",
+    "pauseReason",
+  ]);
+  if (automationPaused) return { ok: false, reason: pauseReason || "Automation is paused" };
+
+  const settings = await getSettings();
+  const log = await getPostLog();
+  const now = Date.now();
+
+  const last = log.length ? log[log.length - 1] : 0;
+  const gapMs = settings.minGapMinutes * 60 * 1000;
+  if (now - last < gapMs) {
+    const waitMin = Math.ceil((gapMs - (now - last)) / 60000);
+    return { ok: false, reason: `Throttled: waiting ${waitMin}m for min gap between posts` };
+  }
+
+  const dayAgo = now - 24 * 60 * 60 * 1000;
+  const last24h = log.filter((ts) => ts > dayAgo).length;
+  if (last24h >= settings.maxPostsPerDay) {
+    return { ok: false, reason: `Throttled: daily cap of ${settings.maxPostsPerDay} posts reached` };
+  }
+
+  return { ok: true };
+}
+
+async function pauseAutomation(reason) {
+  await chrome.storage.local.set({ automationPaused: true, pauseReason: reason });
+}
+
+function jitter(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+async function runQueueCheck() {
+  if (isProcessing) return;
+  isProcessing = true;
+  try {
+    const queue = await getQueue();
+    const now = Date.now();
+    const due = queue.find(
+      (item) =>
+        item.status === "pending" &&
+        (item.scheduledAt === null || item.scheduledAt + (item.dueJitterMs || 0) <= now)
+    );
+    if (!due) return;
+
+    const gate = await checkCanPost();
+    if (!gate.ok) return; // leave item pending, just not its turn yet
+
+    const result = await postOne(due.text, due.media || null);
+
+    const fresh = await getQueue();
+    const idx = fresh.findIndex((i) => i.id === due.id);
+    const { consecutiveFailures } = await chrome.storage.local.get("consecutiveFailures");
+
+    if (result.success) {
+      await recordPosted();
+      await chrome.storage.local.set({ consecutiveFailures: 0 });
+      if (idx !== -1) {
+        fresh[idx].status = "posted";
+        fresh[idx].postedAt = Date.now();
+        fresh[idx].error = null;
+        if (due.media) await deleteMedia(due.media.id).catch(() => {});
+      }
+    } else {
+      const isChallenge = /^CHALLENGE_DETECTED/.test(result.error || "");
+      const failures = (consecutiveFailures || 0) + 1;
+      await chrome.storage.local.set({ consecutiveFailures: failures });
+
+      if (idx !== -1) {
+        fresh[idx].status = "failed";
+        fresh[idx].error = result.error || "Unknown error";
+      }
+
+      if (isChallenge) {
+        await pauseAutomation(
+          "X showed a verification/challenge screen — stopped to avoid making it worse. Resolve manually in the app, then resume."
+        );
+      } else if (failures >= 3) {
+        await pauseAutomation(
+          `${failures} posts failed in a row — pausing so we don't hammer X. Check what's happening, then resume.`
+        );
+      }
+    }
+    if (idx !== -1) await setQueue(fresh);
+  } finally {
+    isProcessing = false;
+  }
+}
+
+function waitForTabComplete(tabId, timeout = 20000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error("Timed out waiting for tab to load"));
+    }, timeout);
+    function listener(updatedTabId, info) {
+      if (updatedTabId === tabId && info.status === "complete") {
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    }
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function postOne(text, media) {
+  let tab;
+  try {
+    let mediaBase64 = null;
+    let mediaType = null;
+    let mediaName = null;
+    if (media) {
+      const record = await getMedia(media.id);
+      if (!record) throw new Error("Attached media not found (was it deleted?)");
+      const buffer = await record.blob.arrayBuffer();
+      mediaBase64 = arrayBufferToBase64(buffer);
+      mediaType = record.type;
+      mediaName = record.name;
+    }
+
+    tab = await chrome.tabs.create({ url: TARGET_URL, active: DEBUG_VISIBLE_TAB });
+    await waitForTabComplete(tab.id);
+    // Give the SPA a moment to hydrate after "complete" fires — jittered so
+    // every run doesn't take an identical, machine-like amount of time.
+    await new Promise((r) => setTimeout(r, jitter(1200, 2800)));
+
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: xAutoPostInjected,
+      args: [text, mediaBase64, mediaType, mediaName],
+    });
+
+    const result = results?.[0]?.result || {
+      success: false,
+      error: "No result from injected script",
+    };
+
+    if (!DEBUG_VISIBLE_TAB && result.success) {
+      setTimeout(() => chrome.tabs.remove(tab.id).catch(() => {}), 2000);
+    }
+    return result;
+  } catch (e) {
+    if (tab && !DEBUG_VISIBLE_TAB) chrome.tabs.remove(tab.id).catch(() => {});
+    return { success: false, error: e.message };
+  }
+}
+
+// Injected into the x.com page. Must be fully self-contained (no outer-scope refs).
+function xAutoPostInjected(text, mediaBase64, mediaType, mediaName) {
+  function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+  function jitter(min, max) {
+    return min + Math.random() * (max - min);
+  }
+  function waitFor(selectors, timeout, interval) {
+    return new Promise((resolve, reject) => {
+      const start = Date.now();
+      (function tick() {
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          if (el) return resolve(el);
+        }
+        if (Date.now() - start > timeout) {
+          return reject(new Error("Timed out waiting for: " + selectors.join(", ")));
+        }
+        setTimeout(tick, interval);
+      })();
+    });
+  }
+
+  function base64ToFile(base64, mimeType, name) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new File([bytes], name, { type: mimeType });
+  }
+
+  function detectChallenge() {
+    const arkose = document.querySelector(
+      'iframe[src*="arkoselabs"], #arkose-iframe, [id*="arkose"]'
+    );
+    if (arkose) return "Arkose/FunCaptcha challenge iframe present";
+    const bodyText = (document.body.innerText || "").slice(0, 4000);
+    if (/unusual activity|verify you.?re human|confirm your identity|account.*locked|suspended/i.test(bodyText)) {
+      return "Page text suggests a verification/lock screen";
+    }
+    return null;
+  }
+
+  async function humanType(editor, text) {
+    editor.focus();
+    document.execCommand("selectAll", false, null);
+    document.execCommand("delete", false, null);
+    let i = 0;
+    while (i < text.length) {
+      const chunkLen = 1 + Math.floor(Math.random() * 3); // 1-3 chars at a time
+      const chunk = text.slice(i, i + chunkLen);
+      const inserted = document.execCommand("insertText", false, chunk);
+      if (!inserted) {
+        editor.textContent = text;
+        editor.dispatchEvent(
+          new InputEvent("input", { bubbles: true, data: text, inputType: "insertText" })
+        );
+        return;
+      }
+      i += chunkLen;
+      const baseDelay = jitter(30, 100);
+      const thinkPause = Math.random() < 0.08 ? jitter(200, 700) : 0; // occasional pause, like a real typist
+      await sleep(baseDelay + thinkPause);
+    }
+  }
+
+  return (async () => {
+    try {
+      const challengeAtStart = detectChallenge();
+      if (challengeAtStart) throw new Error("CHALLENGE_DETECTED: " + challengeAtStart);
+
+      const editorSelectors = [
+        '[data-testid="tweetTextarea_0"]',
+        'div[aria-label="Post text"]',
+        'div[role="textbox"][contenteditable="true"]',
+      ];
+      const editor = await waitFor(editorSelectors, 20000, 250);
+
+      // Brief human-like pause before starting to type, as if reading the screen.
+      await sleep(jitter(400, 1300));
+
+      if (text) {
+        await humanType(editor, text);
+        await sleep(jitter(500, 1400));
+      }
+
+      if (mediaBase64) {
+        await sleep(jitter(300, 900));
+        const fileInputSelectors = [
+          'input[data-testid="fileInput"]',
+          'input[type="file"][accept*="video"]',
+          'input[type="file"][accept*="image"]',
+          'input[type="file"]',
+        ];
+        const fileInput = await waitFor(fileInputSelectors, 10000, 250);
+        const file = base64ToFile(mediaBase64, mediaType, mediaName || "upload");
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        fileInput.files = dt.files;
+        fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+
+      const buttonSelectors = ['[data-testid="tweetButtonInline"]', '[data-testid="tweetButton"]'];
+      const button = await waitFor(buttonSelectors, 10000, 250);
+
+      // Media upload can take a while (esp. video) and X keeps the post
+      // button disabled until it finishes, so give it much longer than text-only.
+      const buttonTimeout = mediaBase64 ? (mediaType?.startsWith("video") ? 90000 : 30000) : 10000;
+      const start = Date.now();
+      while (button.getAttribute("aria-disabled") === "true") {
+        if (Date.now() - start > buttonTimeout) {
+          const mid = detectChallenge();
+          if (mid) throw new Error("CHALLENGE_DETECTED: " + mid);
+          throw new Error(
+            mediaBase64
+              ? "Post button stayed disabled — media may still be uploading/processing or was rejected"
+              : "Post button stayed disabled (empty text or blocked?)"
+          );
+        }
+        await sleep(200);
+      }
+
+      // Human-like pause before submitting, as if reviewing the post.
+      await sleep(jitter(800, 2600));
+      if (button.getAttribute("aria-disabled") === "true") {
+        throw new Error("Post button re-disabled right before click — media likely still processing");
+      }
+
+      // Plain .click() alone sometimes doesn't register with X's handlers reliably;
+      // fire a full pointer/mouse sequence to match a real tap.
+      const evtOpts = { bubbles: true, cancelable: true, view: window };
+      button.dispatchEvent(new PointerEvent("pointerdown", evtOpts));
+      button.dispatchEvent(new MouseEvent("mousedown", evtOpts));
+      button.dispatchEvent(new PointerEvent("pointerup", evtOpts));
+      button.dispatchEvent(new MouseEvent("mouseup", evtOpts));
+      button.click();
+
+      // Verify the post actually went through: either an error toast appears,
+      // or the composer clears/resets (X's normal post-success behavior).
+      const verifyDeadline = Date.now() + 8000;
+      let toastError = null;
+      let cleared = false;
+      while (Date.now() < verifyDeadline) {
+        const challenge = detectChallenge();
+        if (challenge) throw new Error("CHALLENGE_DETECTED: " + challenge);
+
+        const toast = document.querySelector('[data-testid="toast"]');
+        if (toast && /wrong|failed|error|try again|limit/i.test(toast.textContent || "")) {
+          toastError = toast.textContent.trim();
+          break;
+        }
+        const stillEditor = document.querySelector(editorSelectors.join(","));
+        if (!stillEditor || (stillEditor.textContent || "").trim() === "") {
+          cleared = true;
+          break;
+        }
+        await sleep(250);
+      }
+
+      if (toastError) throw new Error("X reported an error: " + toastError);
+      if (!cleared) {
+        throw new Error(
+          "Clicked Post but the composer never cleared — post likely did not submit (button click may not have registered)"
+        );
+      }
+
+      return { success: true };
+    } catch (e) {
+      return { success: false, error: e.message };
+    }
+  })();
+}
