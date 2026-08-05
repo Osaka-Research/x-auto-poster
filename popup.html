@@ -192,6 +192,25 @@
         <input type="text" id="remoteToken" placeholder="token" style="width: 100%; flex: 1;" />
       </div>
       <div id="remoteStatus" style="color: #888; margin-top: 4px;"></div>
+
+      <div class="settingsRow" style="margin-top: 10px; border-top: 1px solid #eee; padding-top: 8px;">
+        <label style="flex: 0 0 auto;">Auto mode (stock photos)</label>
+        <input type="checkbox" id="autoModeEnabled" style="width: auto;" />
+      </div>
+      <div class="settingsRow">
+        <input type="text" id="autoModeQuery" placeholder="topic (blank = curated random)" style="width: 100%; flex: 1;" />
+      </div>
+      <div class="settingsRow">
+        <input type="text" id="autoModeApiKey" placeholder="Pexels API key (free at pexels.com/api)" style="width: 100%; flex: 1;" />
+      </div>
+      <div class="settingsRow">
+        <input type="text" id="autoModeCaption" placeholder="caption (optional)" style="width: 100%; flex: 1;" />
+      </div>
+      <div class="settingsRow">
+        <label for="autoModeCredit">Include photo credit</label>
+        <input type="checkbox" id="autoModeCredit" style="width: auto;" />
+      </div>
+      <div id="autoModeStatus" style="color: #888; margin-top: 4px;"></div>
     </details>
     <script src="idb.js"></script>
     <script src="popup.js"></script>

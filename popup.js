@@ -13,9 +13,25 @@ const maxDailyEl = document.getElementById("maxDaily");
 const remoteUrlEl = document.getElementById("remoteUrl");
 const remoteTokenEl = document.getElementById("remoteToken");
 const remoteStatusEl = document.getElementById("remoteStatus");
+const autoModeEnabledEl = document.getElementById("autoModeEnabled");
+const autoModeQueryEl = document.getElementById("autoModeQuery");
+const autoModeApiKeyEl = document.getElementById("autoModeApiKey");
+const autoModeCaptionEl = document.getElementById("autoModeCaption");
+const autoModeCreditEl = document.getElementById("autoModeCredit");
+const autoModeStatusEl = document.getElementById("autoModeStatus");
 
 const MAX_MEDIA_BYTES = 100 * 1024 * 1024; // 100MB sanity cap
-const DEFAULT_SETTINGS = { minGapMinutes: 20, maxPostsPerDay: 15, remoteUrl: "", remoteToken: "" };
+const DEFAULT_SETTINGS = {
+  minGapMinutes: 20,
+  maxPostsPerDay: 15,
+  remoteUrl: "",
+  remoteToken: "",
+  autoModeEnabled: false,
+  autoModeQuery: "",
+  autoModeApiKey: "",
+  autoModeCaption: "",
+  autoModeCredit: true,
+};
 const MAX_SCHEDULE_JITTER_MS = 3 * 60 * 1000; // up to 3 min, so posts don't fire on the exact minute
 
 mediaEl.onchange = () => {
@@ -70,6 +86,11 @@ async function loadSettings() {
   maxDailyEl.value = merged.maxPostsPerDay;
   remoteUrlEl.value = merged.remoteUrl;
   remoteTokenEl.value = merged.remoteToken;
+  autoModeEnabledEl.checked = !!merged.autoModeEnabled;
+  autoModeQueryEl.value = merged.autoModeQuery;
+  autoModeApiKeyEl.value = merged.autoModeApiKey;
+  autoModeCaptionEl.value = merged.autoModeCaption;
+  autoModeCreditEl.checked = merged.autoModeCredit !== false;
 }
 
 async function saveSettings() {
@@ -77,8 +98,23 @@ async function saveSettings() {
   const maxPostsPerDay = Math.max(1, parseInt(maxDailyEl.value, 10) || 1);
   const remoteUrl = remoteUrlEl.value.trim().replace(/\/+$/, "");
   const remoteToken = remoteTokenEl.value.trim();
+  const autoModeEnabled = autoModeEnabledEl.checked;
+  const autoModeQuery = autoModeQueryEl.value.trim();
+  const autoModeApiKey = autoModeApiKeyEl.value.trim();
+  const autoModeCaption = autoModeCaptionEl.value.trim();
+  const autoModeCredit = autoModeCreditEl.checked;
   await chrome.storage.local.set({
-    settings: { minGapMinutes, maxPostsPerDay, remoteUrl, remoteToken },
+    settings: {
+      minGapMinutes,
+      maxPostsPerDay,
+      remoteUrl,
+      remoteToken,
+      autoModeEnabled,
+      autoModeQuery,
+      autoModeApiKey,
+      autoModeCaption,
+      autoModeCredit,
+    },
   });
 }
 
@@ -86,6 +122,23 @@ minGapEl.onchange = saveSettings;
 maxDailyEl.onchange = saveSettings;
 remoteUrlEl.onchange = saveSettings;
 remoteTokenEl.onchange = saveSettings;
+autoModeEnabledEl.onchange = saveSettings;
+autoModeQueryEl.onchange = saveSettings;
+autoModeApiKeyEl.onchange = saveSettings;
+autoModeCaptionEl.onchange = saveSettings;
+autoModeCreditEl.onchange = saveSettings;
+
+async function renderAutoModeStatus() {
+  const { lastAutoModeFetch } = await chrome.storage.local.get("lastAutoModeFetch");
+  if (!lastAutoModeFetch) {
+    autoModeStatusEl.textContent = "";
+    return;
+  }
+  const when = new Date(lastAutoModeFetch.at).toLocaleTimeString();
+  autoModeStatusEl.textContent = lastAutoModeFetch.error
+    ? `Last fetch ${when}: error — ${lastAutoModeFetch.error}`
+    : `Last fetch ${when}: queued a photo${lastAutoModeFetch.query ? ` for "${lastAutoModeFetch.query}"` : ""}`;
+}
 
 async function renderRemoteStatus() {
   const { lastRemotePoll } = await chrome.storage.local.get("lastRemotePoll");
@@ -123,8 +176,10 @@ async function render() {
 
     const meta = document.createElement("div");
     meta.className = "meta";
+    const sourceTag =
+      item.source === "auto-image" ? " · auto" : item.source === "remote" ? " · remote" : "";
     meta.innerHTML =
-      `<span class="status ${item.status}">${item.status}</span> · ${fmt(item.scheduledAt)}` +
+      `<span class="status ${item.status}">${item.status}</span> · ${fmt(item.scheduledAt)}${sourceTag}` +
       (item.error ? ` · ${item.error}` : "");
 
     const actions = document.createElement("div");
@@ -210,9 +265,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (changes.queue) render();
   if (changes.automationPaused || changes.pauseReason) renderPauseBanner();
   if (changes.lastRemotePoll) renderRemoteStatus();
+  if (changes.lastAutoModeFetch) renderAutoModeStatus();
 });
 
 render();
 renderPauseBanner();
 loadSettings();
 renderRemoteStatus();
+renderAutoModeStatus();

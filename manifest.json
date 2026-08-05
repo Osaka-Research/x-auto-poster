@@ -1,14 +1,16 @@
 {
   "manifest_version": 3,
   "name": "X Post Queue",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Draft and schedule posts locally, auto-post them to X (x.com) when due and the browser is open.",
   "permissions": ["storage", "unlimitedStorage", "alarms", "scripting", "tabs"],
   "host_permissions": [
     "https://x.com/*",
     "https://twitter.com/*",
     "https://*.trycloudflare.com/*",
-    "http://127.0.0.1/*"
+    "http://127.0.0.1/*",
+    "https://api.pexels.com/*",
+    "https://images.pexels.com/*"
   ],
   "background": {
     "service_worker": "background.js"

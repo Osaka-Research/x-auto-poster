@@ -17,6 +17,11 @@ const DEFAULT_SETTINGS = {
   maxPostsPerDay: 15,
   remoteUrl: "",
   remoteToken: "",
+  autoModeEnabled: false,
+  autoModeQuery: "",
+  autoModeApiKey: "",
+  autoModeCaption: "",
+  autoModeCredit: true,
 };
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -29,13 +34,15 @@ chrome.runtime.onStartup.addListener(() => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_NAME) {
-    pollRemoteInbox().finally(() => runQueueCheck());
+    Promise.all([pollRemoteInbox(), maybeTopUpAutoMode()]).finally(() => runQueueCheck());
   }
 });
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "CHECK_NOW") {
-    pollRemoteInbox().finally(() => runQueueCheck().then(() => sendResponse({ ok: true })));
+    Promise.all([pollRemoteInbox(), maybeTopUpAutoMode()]).finally(() =>
+      runQueueCheck().then(() => sendResponse({ ok: true }))
+    );
     return true; // keep channel open for async response
   }
   if (msg?.type === "RESUME_AUTOMATION") {
@@ -152,6 +159,67 @@ async function pollRemoteInbox() {
     });
   } catch (e) {
     await chrome.storage.local.set({ lastRemotePoll: { at: Date.now(), pulled: 0, error: e.message } });
+  }
+}
+
+// If auto mode is on, keeps exactly one stock photo queued up at a time
+// (never stockpiles ahead) so there's always something ready when the
+// existing min-gap/daily-cap gate in runQueueCheck next allows a post.
+// Images come from Pexels' API, which licenses photos for reuse — this does
+// NOT scrape or repost arbitrary images found via a search engine.
+async function maybeTopUpAutoMode() {
+  const settings = await getSettings();
+  if (!settings.autoModeEnabled || !settings.autoModeApiKey) return;
+
+  const queue = await getQueue();
+  const alreadyQueued = queue.some((i) => i.status === "pending" && i.source === "auto-image");
+  if (alreadyQueued) return;
+
+  try {
+    const query = (settings.autoModeQuery || "").trim();
+    const url = query
+      ? `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=1&page=${
+          1 + Math.floor(Math.random() * 100)
+        }`
+      : `https://api.pexels.com/v1/curated?per_page=1&page=${1 + Math.floor(Math.random() * 500)}`;
+
+    const res = await fetch(url, { headers: { Authorization: settings.autoModeApiKey } });
+    if (!res.ok) throw new Error("Pexels API HTTP " + res.status);
+    const data = await res.json();
+    const photo = (data.photos || [])[0];
+    if (!photo) throw new Error(query ? `No results for "${query}"` : "No curated photo returned");
+
+    const imgRes = await fetch(photo.src.large || photo.src.original);
+    if (!imgRes.ok) throw new Error("Image download HTTP " + imgRes.status);
+    const blob = await imgRes.blob();
+
+    const mediaId = crypto.randomUUID();
+    const filename = `pexels-${photo.id}.jpg`;
+    await saveMedia(mediaId, blob, filename, blob.type || "image/jpeg");
+
+    let caption = (settings.autoModeCaption || "").trim();
+    if (settings.autoModeCredit !== false) {
+      const credit = `📷 ${photo.photographer} / Pexels`;
+      caption = caption ? `${caption}\n\n${credit}` : credit;
+    }
+
+    const fresh = await getQueue();
+    fresh.push({
+      id: crypto.randomUUID(),
+      text: caption,
+      media: { id: mediaId, name: filename, type: blob.type || "image/jpeg" },
+      scheduledAt: null,
+      dueJitterMs: 0,
+      status: "pending",
+      error: null,
+      postedAt: null,
+      createdAt: Date.now(),
+      source: "auto-image",
+    });
+    await setQueue(fresh);
+    await chrome.storage.local.set({ lastAutoModeFetch: { at: Date.now(), query, error: null } });
+  } catch (e) {
+    await chrome.storage.local.set({ lastAutoModeFetch: { at: Date.now(), error: e.message } });
   }
 }
 
