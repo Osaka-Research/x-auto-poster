@@ -175,9 +175,14 @@
     <details id="settings">
       <summary>Safety limits</summary>
       <div class="settingsRow">
-        <label for="minGap">Min minutes between posts</label>
-        <input type="number" id="minGap" min="0" />
+        <label for="intervalMinutes">Target interval (min)</label>
+        <input type="number" id="intervalMinutes" min="1" />
       </div>
+      <div class="settingsRow">
+        <label for="intervalJitter">Random variation (%)</label>
+        <input type="number" id="intervalJitter" min="0" max="90" />
+      </div>
+      <div id="intervalPreview" style="color: #888; margin-top: 2px;"></div>
       <div class="settingsRow">
         <label for="maxDaily">Max posts per 24h</label>
         <input type="number" id="maxDaily" min="1" />

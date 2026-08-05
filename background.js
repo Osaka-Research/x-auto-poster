@@ -13,7 +13,8 @@ let isProcessing = false;
 const DEBUG_VISIBLE_TAB = false;
 
 const DEFAULT_SETTINGS = {
-  minGapMinutes: 20,
+  intervalMinutes: 60,
+  intervalJitterPercent: 35,
   maxPostsPerDay: 15,
   remoteUrl: "",
   remoteToken: "",
@@ -223,26 +224,41 @@ async function maybeTopUpAutoMode() {
   }
 }
 
+function jitter(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+// A fixed gap (even a generous one) is itself a machine-like fingerprint —
+// identical spacing between every post. Instead we pick a fresh randomized
+// delay after each post, centered on the target interval, so the cadence is
+// "roughly every N minutes" without ever being exactly N minutes twice in a row.
+function computeNextEligibleDelay(settings) {
+  const baseMs = settings.intervalMinutes * 60 * 1000;
+  const jitterFrac = Math.max(0, Math.min(0.9, (settings.intervalJitterPercent || 0) / 100));
+  return jitter(baseMs * (1 - jitterFrac), baseMs * (1 + jitterFrac));
+}
+
 // Gate on safety limits + pause state. Does NOT gate on whether anything is
 // actually due — callers check that separately.
 async function checkCanPost() {
-  const { automationPaused, pauseReason } = await chrome.storage.local.get([
+  const { automationPaused, pauseReason, nextEligibleAt } = await chrome.storage.local.get([
     "automationPaused",
     "pauseReason",
+    "nextEligibleAt",
   ]);
   if (automationPaused) return { ok: false, reason: pauseReason || "Automation is paused" };
 
-  const settings = await getSettings();
-  const log = await getPostLog();
   const now = Date.now();
-
-  const last = log.length ? log[log.length - 1] : 0;
-  const gapMs = settings.minGapMinutes * 60 * 1000;
-  if (now - last < gapMs) {
-    const waitMin = Math.ceil((gapMs - (now - last)) / 60000);
-    return { ok: false, reason: `Throttled: waiting ${waitMin}m for min gap between posts` };
+  if (nextEligibleAt && now < nextEligibleAt) {
+    const waitMin = Math.ceil((nextEligibleAt - now) / 60000);
+    return {
+      ok: false,
+      reason: `Throttled: next post eligible ~${new Date(nextEligibleAt).toLocaleTimeString()} (${waitMin}m)`,
+    };
   }
 
+  const settings = await getSettings();
+  const log = await getPostLog();
   const dayAgo = now - 24 * 60 * 60 * 1000;
   const last24h = log.filter((ts) => ts > dayAgo).length;
   if (last24h >= settings.maxPostsPerDay) {
@@ -254,10 +270,6 @@ async function checkCanPost() {
 
 async function pauseAutomation(reason) {
   await chrome.storage.local.set({ automationPaused: true, pauseReason: reason });
-}
-
-function jitter(min, max) {
-  return min + Math.random() * (max - min);
 }
 
 async function runQueueCheck() {
@@ -284,7 +296,11 @@ async function runQueueCheck() {
 
     if (result.success) {
       await recordPosted();
-      await chrome.storage.local.set({ consecutiveFailures: 0 });
+      const settings = await getSettings();
+      await chrome.storage.local.set({
+        consecutiveFailures: 0,
+        nextEligibleAt: Date.now() + computeNextEligibleDelay(settings),
+      });
       if (idx !== -1) {
         fresh[idx].status = "posted";
         fresh[idx].postedAt = Date.now();

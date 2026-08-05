@@ -8,7 +8,9 @@ const mediaInfoEl = document.getElementById("mediaInfo");
 const pauseBanner = document.getElementById("pauseBanner");
 const pauseReasonText = document.getElementById("pauseReasonText");
 const resumeBtn = document.getElementById("resumeBtn");
-const minGapEl = document.getElementById("minGap");
+const intervalMinutesEl = document.getElementById("intervalMinutes");
+const intervalJitterEl = document.getElementById("intervalJitter");
+const intervalPreviewEl = document.getElementById("intervalPreview");
 const maxDailyEl = document.getElementById("maxDaily");
 const remoteUrlEl = document.getElementById("remoteUrl");
 const remoteTokenEl = document.getElementById("remoteToken");
@@ -22,7 +24,8 @@ const autoModeStatusEl = document.getElementById("autoModeStatus");
 
 const MAX_MEDIA_BYTES = 100 * 1024 * 1024; // 100MB sanity cap
 const DEFAULT_SETTINGS = {
-  minGapMinutes: 20,
+  intervalMinutes: 60,
+  intervalJitterPercent: 35,
   maxPostsPerDay: 15,
   remoteUrl: "",
   remoteToken: "",
@@ -79,10 +82,20 @@ resumeBtn.onclick = () => {
   chrome.runtime.sendMessage({ type: "RESUME_AUTOMATION" }, () => renderPauseBanner());
 };
 
+function renderIntervalPreview() {
+  const interval = Math.max(1, parseInt(intervalMinutesEl.value, 10) || 1);
+  const jitterPct = Math.max(0, Math.min(90, parseInt(intervalJitterEl.value, 10) || 0));
+  const jitterFrac = jitterPct / 100;
+  const lo = Math.round(interval * (1 - jitterFrac));
+  const hi = Math.round(interval * (1 + jitterFrac));
+  intervalPreviewEl.textContent = `≈ every ${lo}-${hi} min, randomized each time`;
+}
+
 async function loadSettings() {
   const { settings } = await chrome.storage.local.get("settings");
   const merged = Object.assign({}, DEFAULT_SETTINGS, settings || {});
-  minGapEl.value = merged.minGapMinutes;
+  intervalMinutesEl.value = merged.intervalMinutes;
+  intervalJitterEl.value = merged.intervalJitterPercent;
   maxDailyEl.value = merged.maxPostsPerDay;
   remoteUrlEl.value = merged.remoteUrl;
   remoteTokenEl.value = merged.remoteToken;
@@ -91,10 +104,12 @@ async function loadSettings() {
   autoModeApiKeyEl.value = merged.autoModeApiKey;
   autoModeCaptionEl.value = merged.autoModeCaption;
   autoModeCreditEl.checked = merged.autoModeCredit !== false;
+  renderIntervalPreview();
 }
 
 async function saveSettings() {
-  const minGapMinutes = Math.max(0, parseInt(minGapEl.value, 10) || 0);
+  const intervalMinutes = Math.max(1, parseInt(intervalMinutesEl.value, 10) || 1);
+  const intervalJitterPercent = Math.max(0, Math.min(90, parseInt(intervalJitterEl.value, 10) || 0));
   const maxPostsPerDay = Math.max(1, parseInt(maxDailyEl.value, 10) || 1);
   const remoteUrl = remoteUrlEl.value.trim().replace(/\/+$/, "");
   const remoteToken = remoteTokenEl.value.trim();
@@ -105,7 +120,8 @@ async function saveSettings() {
   const autoModeCredit = autoModeCreditEl.checked;
   await chrome.storage.local.set({
     settings: {
-      minGapMinutes,
+      intervalMinutes,
+      intervalJitterPercent,
       maxPostsPerDay,
       remoteUrl,
       remoteToken,
@@ -116,9 +132,11 @@ async function saveSettings() {
       autoModeCredit,
     },
   });
+  renderIntervalPreview();
 }
 
-minGapEl.onchange = saveSettings;
+intervalMinutesEl.onchange = saveSettings;
+intervalJitterEl.onchange = saveSettings;
 maxDailyEl.onchange = saveSettings;
 remoteUrlEl.onchange = saveSettings;
 remoteTokenEl.onchange = saveSettings;
