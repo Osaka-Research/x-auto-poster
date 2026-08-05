@@ -196,8 +196,10 @@ async function render() {
     meta.className = "meta";
     const sourceTag =
       item.source === "auto-image" ? " · auto" : item.source === "remote" ? " · remote" : "";
+    const attemptsTag =
+      item.attempts > 0 ? ` · attempt ${item.attempts}${item.status === "pending" ? " (retrying)" : ""}` : "";
     meta.innerHTML =
-      `<span class="status ${item.status}">${item.status}</span> · ${fmt(item.scheduledAt)}${sourceTag}` +
+      `<span class="status ${item.status}">${item.status}</span> · ${fmt(item.scheduledAt)}${sourceTag}${attemptsTag}` +
       (item.error ? ` · ${item.error}` : "");
 
     const actions = document.createElement("div");

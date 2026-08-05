@@ -54,6 +54,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 });
 
+// Plain fetch() has no built-in timeout — a stalled mobile connection would
+// otherwise hang a poll cycle indefinitely instead of surfacing an error.
+async function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function getQueue() {
   const { queue } = await chrome.storage.local.get("queue");
   return Array.isArray(queue) ? queue : [];
@@ -100,7 +112,7 @@ async function pollRemoteInbox() {
   if (!settings.remoteUrl || !settings.remoteToken) return;
 
   try {
-    const res = await fetch(settings.remoteUrl + "/pending", {
+    const res = await fetchWithTimeout(settings.remoteUrl + "/pending", {
       headers: { Authorization: "Bearer " + settings.remoteToken },
     });
     if (!res.ok) throw new Error("HTTP " + res.status);
@@ -149,11 +161,11 @@ async function pollRemoteInbox() {
     await chrome.storage.local.set({ processedRemoteIds: Array.from(processed).slice(-1000) });
 
     // Best-effort cleanup; a failed ack just means these get skipped (dedup'd) next poll.
-    fetch(settings.remoteUrl + "/ack", {
+    fetchWithTimeout(settings.remoteUrl + "/ack", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + settings.remoteToken },
       body: JSON.stringify({ ids: ackIds }),
-    }).catch(() => {});
+    }, 10000).catch(() => {});
 
     await chrome.storage.local.set({
       lastRemotePoll: { at: Date.now(), pulled: addedCount, error: null },
@@ -184,13 +196,13 @@ async function maybeTopUpAutoMode() {
         }`
       : `https://api.pexels.com/v1/curated?per_page=1&page=${1 + Math.floor(Math.random() * 500)}`;
 
-    const res = await fetch(url, { headers: { Authorization: settings.autoModeApiKey } });
+    const res = await fetchWithTimeout(url, { headers: { Authorization: settings.autoModeApiKey } });
     if (!res.ok) throw new Error("Pexels API HTTP " + res.status);
     const data = await res.json();
     const photo = (data.photos || [])[0];
     if (!photo) throw new Error(query ? `No results for "${query}"` : "No curated photo returned");
 
-    const imgRes = await fetch(photo.src.large || photo.src.original);
+    const imgRes = await fetchWithTimeout(photo.src.large || photo.src.original, {}, 30000);
     if (!imgRes.ok) throw new Error("Image download HTTP " + imgRes.status);
     const blob = await imgRes.blob();
 
@@ -313,8 +325,14 @@ async function runQueueCheck() {
       await chrome.storage.local.set({ consecutiveFailures: failures });
 
       if (idx !== -1) {
-        fresh[idx].status = "failed";
+        const attempts = (fresh[idx].attempts || 0) + 1;
+        fresh[idx].attempts = attempts;
         fresh[idx].error = result.error || "Unknown error";
+        // Transient failures (network blip, X being slow) get a few automatic
+        // retries at the normal cadence instead of dying and needing a manual
+        // "Post now". Challenge/captcha failures never auto-retry — see below.
+        const MAX_ATTEMPTS = 3;
+        fresh[idx].status = !isChallenge && attempts < MAX_ATTEMPTS ? "pending" : "failed";
       }
 
       if (isChallenge) {
