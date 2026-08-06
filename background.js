@@ -19,6 +19,7 @@ const DEFAULT_SETTINGS = {
   remoteUrl: "",
   remoteToken: "",
   autoModeEnabled: false,
+  autoModeMediaType: "photo",
   autoModeQuery: "",
   autoModeApiKey: "",
   autoModeCaption: "",
@@ -175,11 +176,73 @@ async function pollRemoteInbox() {
   }
 }
 
-// If auto mode is on, keeps exactly one stock photo queued up at a time
+// Picks a Pexels photo or video (per settings.autoModeMediaType) to top up
+// with. Kept separate from the queueing logic below so both media kinds
+// share one code path for saving/queueing.
+async function fetchAutoModeMedia(settings) {
+  const query = (settings.autoModeQuery || "").trim();
+
+  if (settings.autoModeMediaType === "video") {
+    const url = query
+      ? `https://api.pexels.com/v1/videos/search?query=${encodeURIComponent(query)}&per_page=1&page=${
+          1 + Math.floor(Math.random() * 50)
+        }`
+      : `https://api.pexels.com/v1/videos/popular?per_page=1&page=${1 + Math.floor(Math.random() * 40)}`;
+
+    const res = await fetchWithTimeout(url, { headers: { Authorization: settings.autoModeApiKey } });
+    if (!res.ok) throw new Error("Pexels Video API HTTP " + res.status);
+    const data = await res.json();
+    const video = (data.videos || [])[0];
+    if (!video) throw new Error(query ? `No video results for "${query}"` : "No popular video returned");
+
+    const files = (video.video_files || []).filter((f) => f.file_type === "video/mp4" && f.link);
+    files.sort((a, b) => (a.width || 9999) - (b.width || 9999));
+    const chosen = files.find((f) => f.quality === "sd") || files[0];
+    if (!chosen) throw new Error("That video has no usable mp4 file");
+
+    const fileRes = await fetchWithTimeout(chosen.link, {}, 60000);
+    if (!fileRes.ok) throw new Error("Video download HTTP " + fileRes.status);
+    const blob = await fileRes.blob();
+
+    return {
+      blob,
+      filename: `pexels-${video.id}.mp4`,
+      mimeType: "video/mp4",
+      credit: `🎬 ${video.user?.name || "unknown"} / Pexels`,
+      query,
+    };
+  }
+
+  const url = query
+    ? `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=1&page=${
+        1 + Math.floor(Math.random() * 100)
+      }`
+    : `https://api.pexels.com/v1/curated?per_page=1&page=${1 + Math.floor(Math.random() * 500)}`;
+
+  const res = await fetchWithTimeout(url, { headers: { Authorization: settings.autoModeApiKey } });
+  if (!res.ok) throw new Error("Pexels API HTTP " + res.status);
+  const data = await res.json();
+  const photo = (data.photos || [])[0];
+  if (!photo) throw new Error(query ? `No results for "${query}"` : "No curated photo returned");
+
+  const imgRes = await fetchWithTimeout(photo.src.large || photo.src.original, {}, 30000);
+  if (!imgRes.ok) throw new Error("Image download HTTP " + imgRes.status);
+  const blob = await imgRes.blob();
+
+  return {
+    blob,
+    filename: `pexels-${photo.id}.jpg`,
+    mimeType: blob.type || "image/jpeg",
+    credit: `📷 ${photo.photographer} / Pexels`,
+    query,
+  };
+}
+
+// If auto mode is on, keeps exactly one stock photo/video queued up at a time
 // (never stockpiles ahead) so there's always something ready when the
-// existing min-gap/daily-cap gate in runQueueCheck next allows a post.
-// Images come from Pexels' API, which licenses photos for reuse — this does
-// NOT scrape or repost arbitrary images found via a search engine.
+// existing interval/daily-cap gate in runQueueCheck next allows a post.
+// Media comes from Pexels' API, which licenses both for reuse — this does
+// NOT scrape or repost arbitrary media found via a search engine.
 async function maybeTopUpAutoMode() {
   const settings = await getSettings();
   if (!settings.autoModeEnabled || !settings.autoModeApiKey) return;
@@ -189,30 +252,13 @@ async function maybeTopUpAutoMode() {
   if (alreadyQueued) return;
 
   try {
-    const query = (settings.autoModeQuery || "").trim();
-    const url = query
-      ? `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=1&page=${
-          1 + Math.floor(Math.random() * 100)
-        }`
-      : `https://api.pexels.com/v1/curated?per_page=1&page=${1 + Math.floor(Math.random() * 500)}`;
-
-    const res = await fetchWithTimeout(url, { headers: { Authorization: settings.autoModeApiKey } });
-    if (!res.ok) throw new Error("Pexels API HTTP " + res.status);
-    const data = await res.json();
-    const photo = (data.photos || [])[0];
-    if (!photo) throw new Error(query ? `No results for "${query}"` : "No curated photo returned");
-
-    const imgRes = await fetchWithTimeout(photo.src.large || photo.src.original, {}, 30000);
-    if (!imgRes.ok) throw new Error("Image download HTTP " + imgRes.status);
-    const blob = await imgRes.blob();
+    const { blob, filename, mimeType, credit, query } = await fetchAutoModeMedia(settings);
 
     const mediaId = crypto.randomUUID();
-    const filename = `pexels-${photo.id}.jpg`;
-    await saveMedia(mediaId, blob, filename, blob.type || "image/jpeg");
+    await saveMedia(mediaId, blob, filename, mimeType);
 
     let caption = (settings.autoModeCaption || "").trim();
     if (settings.autoModeCredit !== false) {
-      const credit = `📷 ${photo.photographer} / Pexels`;
       caption = caption ? `${caption}\n\n${credit}` : credit;
     }
 
@@ -220,7 +266,7 @@ async function maybeTopUpAutoMode() {
     fresh.push({
       id: crypto.randomUUID(),
       text: caption,
-      media: { id: mediaId, name: filename, type: blob.type || "image/jpeg" },
+      media: { id: mediaId, name: filename, type: mimeType },
       scheduledAt: null,
       dueJitterMs: 0,
       status: "pending",
@@ -230,7 +276,9 @@ async function maybeTopUpAutoMode() {
       source: "auto-image",
     });
     await setQueue(fresh);
-    await chrome.storage.local.set({ lastAutoModeFetch: { at: Date.now(), query, error: null } });
+    await chrome.storage.local.set({
+      lastAutoModeFetch: { at: Date.now(), query, mediaKind: settings.autoModeMediaType, error: null },
+    });
   } catch (e) {
     await chrome.storage.local.set({ lastAutoModeFetch: { at: Date.now(), error: e.message } });
   }

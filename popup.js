@@ -17,6 +17,7 @@ const remoteUrlEl = document.getElementById("remoteUrl");
 const remoteTokenEl = document.getElementById("remoteToken");
 const remoteStatusEl = document.getElementById("remoteStatus");
 const autoModeEnabledEl = document.getElementById("autoModeEnabled");
+const autoModeMediaTypeEl = document.getElementById("autoModeMediaType");
 const autoModeQueryEl = document.getElementById("autoModeQuery");
 const autoModeApiKeyEl = document.getElementById("autoModeApiKey");
 const autoModeCaptionEl = document.getElementById("autoModeCaption");
@@ -31,6 +32,7 @@ const DEFAULT_SETTINGS = {
   remoteUrl: "",
   remoteToken: "",
   autoModeEnabled: false,
+  autoModeMediaType: "photo",
   autoModeQuery: "",
   autoModeApiKey: "",
   autoModeCaption: "",
@@ -123,6 +125,7 @@ async function loadSettings() {
   remoteUrlEl.value = merged.remoteUrl;
   remoteTokenEl.value = merged.remoteToken;
   autoModeEnabledEl.checked = !!merged.autoModeEnabled;
+  autoModeMediaTypeEl.value = merged.autoModeMediaType === "video" ? "video" : "photo";
   autoModeQueryEl.value = merged.autoModeQuery;
   autoModeApiKeyEl.value = merged.autoModeApiKey;
   autoModeCaptionEl.value = merged.autoModeCaption;
@@ -137,6 +140,7 @@ async function saveSettings() {
   const remoteUrl = remoteUrlEl.value.trim().replace(/\/+$/, "");
   const remoteToken = remoteTokenEl.value.trim();
   const autoModeEnabled = autoModeEnabledEl.checked;
+  const autoModeMediaType = autoModeMediaTypeEl.value === "video" ? "video" : "photo";
   const autoModeQuery = autoModeQueryEl.value.trim();
   const autoModeApiKey = autoModeApiKeyEl.value.trim();
   const autoModeCaption = autoModeCaptionEl.value.trim();
@@ -149,6 +153,7 @@ async function saveSettings() {
       remoteUrl,
       remoteToken,
       autoModeEnabled,
+      autoModeMediaType,
       autoModeQuery,
       autoModeApiKey,
       autoModeCaption,
@@ -161,6 +166,7 @@ async function saveSettings() {
 intervalMinutesEl.onchange = saveSettings;
 intervalJitterEl.onchange = saveSettings;
 maxDailyEl.onchange = saveSettings;
+autoModeMediaTypeEl.onchange = saveSettings;
 remoteUrlEl.onchange = saveSettings;
 remoteTokenEl.onchange = saveSettings;
 autoModeEnabledEl.onchange = saveSettings;
@@ -176,9 +182,10 @@ async function renderAutoModeStatus() {
     return;
   }
   const when = new Date(lastAutoModeFetch.at).toLocaleTimeString();
+  const kind = lastAutoModeFetch.mediaKind === "video" ? "video" : "photo";
   autoModeStatusEl.textContent = lastAutoModeFetch.error
     ? `Last fetch ${when}: error — ${lastAutoModeFetch.error}`
-    : `Last fetch ${when}: queued a photo${lastAutoModeFetch.query ? ` for "${lastAutoModeFetch.query}"` : ""}`;
+    : `Last fetch ${when}: queued a ${kind}${lastAutoModeFetch.query ? ` for "${lastAutoModeFetch.query}"` : ""}`;
 }
 
 async function renderRemoteStatus() {
