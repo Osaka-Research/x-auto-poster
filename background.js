@@ -379,16 +379,19 @@ async function getOrCreateManagedTab() {
       if (existing) {
         await chrome.tabs.update(existing.id, { url: TARGET_URL });
         await waitForTabComplete(existing.id);
-        return existing.id;
+        return { tabId: existing.id, fresh: false };
       }
     } catch (e) {
       // Tab's gone — fall through and make a new one.
     }
   }
+  // No managed tab yet — either the very first run, or Kiwi just (re)started
+  // and storage.session was cleared. Either way this is a cold load, which
+  // needs more settle time than a tab that's already warmed up and hydrated.
   const tab = await chrome.tabs.create({ url: TARGET_URL, active: DEBUG_VISIBLE_TAB });
   await waitForTabComplete(tab.id);
   await chrome.storage.session.set({ managedTabId: tab.id });
-  return tab.id;
+  return { tabId: tab.id, fresh: true };
 }
 
 function arrayBufferToBase64(buffer) {
@@ -415,10 +418,14 @@ async function postOne(text, media) {
       mediaName = record.name;
     }
 
-    const tabId = await getOrCreateManagedTab();
+    const { tabId, fresh } = await getOrCreateManagedTab();
     // Give the SPA a moment to hydrate after "complete" fires — jittered so
     // every run doesn't take an identical, machine-like amount of time.
-    await new Promise((r) => setTimeout(r, jitter(1200, 2800)));
+    // A freshly-created tab (first run, or Kiwi just restarted) needs
+    // noticeably longer — "network complete" fires well before the compose
+    // toolbar has actually finished mounting on a cold load.
+    const settleRange = fresh ? [3500, 7000] : [1200, 2800];
+    await new Promise((r) => setTimeout(r, jitter(settleRange[0], settleRange[1])));
 
     const results = await chrome.scripting.executeScript({
       target: { tabId },
@@ -531,7 +538,10 @@ function xAutoPostInjected(text, mediaBase64, mediaType, mediaName) {
           'input[type="file"][accept*="image"]',
           'input[type="file"]',
         ];
-        const fileInput = await waitFor(fileInputSelectors, 10000, 250);
+        // Same 20s patience as the editor — on a cold Kiwi start the compose
+        // toolbar (which the file input lives in) can mount well after the
+        // textarea does, and 10s wasn't always enough for it to show up.
+        const fileInput = await waitFor(fileInputSelectors, 20000, 250);
         const file = base64ToFile(mediaBase64, mediaType, mediaName || "upload");
         const dt = new DataTransfer();
         dt.items.add(file);
