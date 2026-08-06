@@ -253,23 +253,36 @@ function computeNextEligibleDelay(settings) {
 // Gate on safety limits + pause state. Does NOT gate on whether anything is
 // actually due — callers check that separately.
 async function checkCanPost() {
-  const { automationPaused, pauseReason, nextEligibleAt } = await chrome.storage.local.get([
+  const { automationPaused, pauseReason, nextEligibleAt, lastPostedAt } = await chrome.storage.local.get([
     "automationPaused",
     "pauseReason",
     "nextEligibleAt",
+    "lastPostedAt",
   ]);
   if (automationPaused) return { ok: false, reason: pauseReason || "Automation is paused" };
 
   const now = Date.now();
-  if (nextEligibleAt && now < nextEligibleAt) {
-    const waitMin = Math.ceil((nextEligibleAt - now) / 60000);
+  const settings = await getSettings();
+
+  // nextEligibleAt is set right after every successful post and survives
+  // restarts (chrome.storage.local, not session). If it's ever missing —
+  // e.g. a partial storage wipe — but we still have a record of when we
+  // last actually posted, rebuild the gate from that instead of treating
+  // "no record found" as "safe to post immediately."
+  let gateUntil = nextEligibleAt;
+  if (!gateUntil && lastPostedAt) {
+    gateUntil = lastPostedAt + computeNextEligibleDelay(settings);
+    await chrome.storage.local.set({ nextEligibleAt: gateUntil });
+  }
+
+  if (gateUntil && now < gateUntil) {
+    const waitMin = Math.ceil((gateUntil - now) / 60000);
     return {
       ok: false,
-      reason: `Throttled: next post eligible ~${new Date(nextEligibleAt).toLocaleTimeString()} (${waitMin}m)`,
+      reason: `Throttled: next post eligible ~${new Date(gateUntil).toLocaleTimeString()} (${waitMin}m)`,
     };
   }
 
-  const settings = await getSettings();
   const log = await getPostLog();
   const dayAgo = now - 24 * 60 * 60 * 1000;
   const last24h = log.filter((ts) => ts > dayAgo).length;
@@ -309,9 +322,11 @@ async function runQueueCheck() {
     if (result.success) {
       await recordPosted();
       const settings = await getSettings();
+      const postedAt = Date.now();
       await chrome.storage.local.set({
         consecutiveFailures: 0,
-        nextEligibleAt: Date.now() + computeNextEligibleDelay(settings),
+        lastPostedAt: postedAt,
+        nextEligibleAt: postedAt + computeNextEligibleDelay(settings),
       });
       if (idx !== -1) {
         fresh[idx].status = "posted";

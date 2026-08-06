@@ -8,6 +8,7 @@ const mediaInfoEl = document.getElementById("mediaInfo");
 const pauseBanner = document.getElementById("pauseBanner");
 const pauseReasonText = document.getElementById("pauseReasonText");
 const resumeBtn = document.getElementById("resumeBtn");
+const cadenceStatusEl = document.getElementById("cadenceStatus");
 const intervalMinutesEl = document.getElementById("intervalMinutes");
 const intervalJitterEl = document.getElementById("intervalJitter");
 const intervalPreviewEl = document.getElementById("intervalPreview");
@@ -76,6 +77,28 @@ async function renderPauseBanner() {
   } else {
     pauseBanner.style.display = "none";
   }
+}
+
+async function renderCadenceStatus() {
+  const { lastPostedAt, nextEligibleAt } = await chrome.storage.local.get([
+    "lastPostedAt",
+    "nextEligibleAt",
+  ]);
+  if (!lastPostedAt) {
+    cadenceStatusEl.textContent = "No posts yet.";
+    return;
+  }
+  const parts = [`Last posted: ${new Date(lastPostedAt).toLocaleString()}`];
+  if (nextEligibleAt) {
+    const now = Date.now();
+    if (now < nextEligibleAt) {
+      const waitMin = Math.ceil((nextEligibleAt - now) / 60000);
+      parts.push(`next eligible ~${new Date(nextEligibleAt).toLocaleTimeString()} (${waitMin}m)`);
+    } else {
+      parts.push("eligible now");
+    }
+  }
+  cadenceStatusEl.textContent = parts.join(" · ");
 }
 
 resumeBtn.onclick = () => {
@@ -286,6 +309,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (changes.automationPaused || changes.pauseReason) renderPauseBanner();
   if (changes.lastRemotePoll) renderRemoteStatus();
   if (changes.lastAutoModeFetch) renderAutoModeStatus();
+  if (changes.lastPostedAt || changes.nextEligibleAt) renderCadenceStatus();
 });
 
 render();
@@ -293,3 +317,5 @@ renderPauseBanner();
 loadSettings();
 renderRemoteStatus();
 renderAutoModeStatus();
+renderCadenceStatus();
+setInterval(renderCadenceStatus, 30000); // keep the countdown fresh while popup is open
