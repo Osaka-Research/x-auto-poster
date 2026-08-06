@@ -193,6 +193,15 @@ async function renderRemoteStatus() {
     : `Last poll ${when}: pulled ${lastRemotePoll.pulled}`;
 }
 
+function countdownText(ms) {
+  if (ms <= 0) return null;
+  const totalMin = Math.ceil(ms / 60000);
+  if (totalMin < 60) return `in ${totalMin}m`;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return `in ${h}h${m ? ` ${m}m` : ""}`;
+}
+
 async function render() {
   const queue = await getQueue();
   listEl.innerHTML = "";
@@ -200,6 +209,17 @@ async function render() {
     listEl.innerHTML = '<div class="empty">No queued posts yet</div>';
     return;
   }
+
+  const { nextEligibleAt } = await chrome.storage.local.get("nextEligibleAt");
+  const now = Date.now();
+
+  // How many pending items are already past their own scheduled time (or have
+  // none) — only one of these can actually go out next, the rest are stacked
+  // up behind it regardless of what the global gate countdown says.
+  const readyCount = queue.filter(
+    (i) => i.status === "pending" && (i.scheduledAt === null || i.scheduledAt + (i.dueJitterMs || 0) <= now)
+  ).length;
+
   const sorted = [...queue].sort((a, b) => (a.scheduledAt || 0) - (b.scheduledAt || 0));
   for (const item of sorted) {
     const li = document.createElement("li");
@@ -221,8 +241,23 @@ async function render() {
       item.source === "auto-image" ? " · auto" : item.source === "remote" ? " · remote" : "";
     const attemptsTag =
       item.attempts > 0 ? ` · attempt ${item.attempts}${item.status === "pending" ? " (retrying)" : ""}` : "";
+
+    let countdownTag = "";
+    if (item.status === "pending") {
+      const ownDueAt = item.scheduledAt === null ? now : item.scheduledAt + (item.dueJitterMs || 0);
+      const eta = Math.max(ownDueAt, nextEligibleAt || 0);
+      const cd = countdownText(eta - now);
+      if (cd) {
+        countdownTag = ` · ${cd}`;
+      } else if (readyCount > 1) {
+        countdownTag = " · next up (queue has others waiting)";
+      } else {
+        countdownTag = " · posting on next check";
+      }
+    }
+
     meta.innerHTML =
-      `<span class="status ${item.status}">${item.status}</span> · ${fmt(item.scheduledAt)}${sourceTag}${attemptsTag}` +
+      `<span class="status ${item.status}">${item.status}</span> · ${fmt(item.scheduledAt)}${sourceTag}${attemptsTag}${countdownTag}` +
       (item.error ? ` · ${item.error}` : "");
 
     const actions = document.createElement("div");
@@ -305,7 +340,7 @@ checkNowBtn.onclick = () => {
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
-  if (changes.queue) render();
+  if (changes.queue || changes.nextEligibleAt) render();
   if (changes.automationPaused || changes.pauseReason) renderPauseBanner();
   if (changes.lastRemotePoll) renderRemoteStatus();
   if (changes.lastAutoModeFetch) renderAutoModeStatus();
@@ -318,4 +353,9 @@ loadSettings();
 renderRemoteStatus();
 renderAutoModeStatus();
 renderCadenceStatus();
-setInterval(renderCadenceStatus, 30000); // keep the countdown fresh while popup is open
+// Countdowns tick down purely with elapsed time, not storage changes, so
+// they need their own refresh even when nothing in storage has moved.
+setInterval(() => {
+  render();
+  renderCadenceStatus();
+}, 30000);
