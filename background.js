@@ -610,6 +610,32 @@ function xAutoPostInjected(text, mediaBase64, mediaType, mediaName) {
         dt.items.add(file);
         fileInput.files = dt.files;
         fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+
+        // The compose button's aria-disabled flips to enabled as soon as
+        // *something* is attached — not once the upload to X's media
+        // servers has actually finished. Relying on that alone posts a
+        // video-less tweet if you click while the upload is still running.
+        // So: wait for the attachment chip to mount, hold for a minimum
+        // time scaled to file size, then also poll for any visible
+        // progress indicator to clear before ever touching Post.
+        const mediaChipSelectors = ['[data-testid="removeMediaButton"]', '[data-testid="attachments"]'];
+        await waitFor(mediaChipSelectors, 15000, 250).catch(() => {});
+
+        const isVideo = !!mediaType?.startsWith("video");
+        const sizeMB = (file.size || 0) / (1024 * 1024);
+        const minUploadWaitMs = isVideo
+          ? Math.min(60000, Math.max(6000, sizeMB * 4000))
+          : Math.min(15000, Math.max(2000, sizeMB * 1500));
+        await sleep(minUploadWaitMs);
+
+        const progressDeadline = Date.now() + (isVideo ? 60000 : 15000);
+        while (Date.now() < progressDeadline) {
+          const progressEl = document.querySelector(
+            '[role="progressbar"], [data-testid="mediaUploadProgress"]'
+          );
+          if (!progressEl) break;
+          await sleep(300);
+        }
       }
 
       const buttonSelectors = ['[data-testid="tweetButtonInline"]', '[data-testid="tweetButton"]'];
@@ -636,6 +662,19 @@ function xAutoPostInjected(text, mediaBase64, mediaType, mediaName) {
       await sleep(jitter(800, 2600));
       if (button.getAttribute("aria-disabled") === "true") {
         throw new Error("Post button re-disabled right before click — media likely still processing");
+      }
+
+      // Belt-and-suspenders: if a progress indicator reappeared or is still
+      // there right before we click, wait it out rather than posting text-only.
+      if (mediaBase64) {
+        const finalCheckDeadline = Date.now() + (mediaType?.startsWith("video") ? 30000 : 10000);
+        while (Date.now() < finalCheckDeadline) {
+          const stillUploading = document.querySelector(
+            '[role="progressbar"], [data-testid="mediaUploadProgress"]'
+          );
+          if (!stillUploading) break;
+          await sleep(300);
+        }
       }
 
       // Plain .click() alone sometimes doesn't register with X's handlers reliably;
